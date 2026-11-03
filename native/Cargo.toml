@@ -1,0 +1,21 @@
+[package]
+name = "lensbolt-android"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/akhil-dara/lensbolt-android"
+description = "LensBolt receiver for Android (JNI over lensbolt-core)"
+
+[lib]
+name = "lensbolt"
+crate-type = ["cdylib"]
+
+[dependencies]
+lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.0", default-features = false, features = ["zstd"] }
+jni = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

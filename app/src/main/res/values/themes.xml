@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Always dark: a camera viewfinder world (the system light theme does not restyle it). Edge to edge: the
+         screen draws behind transparent system bars and applies their insets itself. -->
+    <style name="Theme.LensBolt" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#2563EB</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <!-- dialog buttons, menu checks: the light tone of the brand blue reads on dark surfaces -->
+        <item name="colorAccent">#8DB2FF</item>
+        <item name="colorControlActivated">#8DB2FF</item>
+        <item name="android:colorBackgroundFloating">#1A212C</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

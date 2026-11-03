@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the only files LensBolt hands to other apps (Open / Share): the received file in its private cache -->
+<paths>
+    <cache-path name="rx" path="rx/" />
+</paths>
