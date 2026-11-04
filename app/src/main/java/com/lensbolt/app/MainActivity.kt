@@ -120,6 +120,12 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     @Volatile private var camFps = 0.0
     private var camFrames = 0
     private var camT0 = 0L
+    // lab log: since the last row, the longest gap between the camera's frame timestamps and the longest the
+    // analyzer held a frame (fewer frames from the camera itself, or a slow analyzer); written on the analyzer
+    // thread, read and reset on the UI thread (a diagnostic: an occasional lost maximum is fine)
+    @Volatile private var camGapMaxNs = 0L
+    @Volatile private var frameHoldMaxNs = 0L
+    private var lastSensorNs = 0L
     private var cameraProblem = false
     // a stream change in progress: the first frame of the new binding ends "Changing camera…" (never a late frame of
     // the stream being replaced)
@@ -463,10 +469,14 @@ class MainActivity : AppCompatActivity(), ScreenHost {
 
     // `bind`: the binding whose analyzer delivered this frame
     private fun onFrame(img: ImageProxy, bind: Int) {
+        val held = System.nanoTime()
         try {
             camFrames++
             if (change.frame(bind)) ui.post { if (!change.waiting()) endChanging() }
             val now = System.nanoTime()
+            val ts = img.imageInfo.timestamp
+            if (lastSensorNs != 0L && ts > lastSensorNs) camGapMaxNs = maxOf(camGapMaxNs, ts - lastSensorNs)
+            lastSensorNs = ts
             if (camT0 == 0L) camT0 = now
             if (now - camT0 >= 1_000_000_000L) { camFps = camFrames * 1e9 / (now - camT0); camFrames = 0; camT0 = now }
             if (img.format != ImageFormat.YUV_420_888 || img.planes.size < 3) return
@@ -480,6 +490,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             // one bad frame never stops the camera
         } finally {
             img.close()
+            frameHoldMaxNs = maxOf(frameHoldMaxNs, System.nanoTime() - held)
         }
     }
 
@@ -692,8 +703,14 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val json = sessions.withHandle { h -> if (h == 0L) "{}" else Native.status(h) }
         val s = try { JSONObject(json) } catch (_: Throwable) { return }
         if (lab && logTick % 5 == 0) {
+            val gapMs = camGapMaxNs / 1e6; camGapMaxNs = 0L
+            val holdMs = frameHoldMaxNs / 1e6; frameHoldMaxNs = 0L
+            val power = getSystemService(android.os.PowerManager::class.java)
+            val thermal = power?.currentThermalStatus ?: -1
+            // the forecast share of the throttling threshold in 1 s (1.0 = throttling); -1 where unknown (JSON has no NaN)
+            val headroom = if (android.os.Build.VERSION.SDK_INT >= 30) (power?.getThermalHeadroom(1) ?: -1f).toDouble().takeIf { it.isFinite() } ?: -1.0 else -1.0
             val line = ("{\"wall_ms\":${System.currentTimeMillis()},\"camera\":\"$camSize\",\"lens\":\"${boundLens?.id ?: "?"}\",\"camera_fps\":%.1f,\"ev\":$evIndex," +
-                "\"exposure_ns\":$resultExpNs,\"iso\":$resultIso,\"af_state\":$afState,\"focus_diopters\":%.2f,\"focus_locked\":${focusLock.locked},\"focus_failed\":${focusLock.failedLocks},\"phase\":\"${phase.state}\",\"phase_steps\":${phase.steps},\"phase_searches\":${phase.searches},\"phase_ignored\":${phase.ignored},\"phase_locked\":${phase.locked},\"phase_shift_ms\":%.2f,\"phase_cum_ms\":%.2f,\"phase_exact\":${phaseCtl?.lastExact ?: false},\"phase_carry\":${phaseCtl?.carry ?: 0},\"phase_fallback_off\":${phaseCtl?.fallbackOff ?: false},\"settle_mix\":%.2f,\"frame_ms\":%.3f,\"status\":$json}").format(java.util.Locale.ROOT, camFps, focusDiopters, phase.lastMoveMs, phase.cumulativeMs, phase.settleMix, phaseCtl?.frameMs ?: 0.0)
+                "\"exposure_ns\":$resultExpNs,\"iso\":$resultIso,\"af_state\":$afState,\"focus_diopters\":%.2f,\"focus_locked\":${focusLock.locked},\"focus_failed\":${focusLock.failedLocks},\"phase\":\"${phase.state}\",\"phase_steps\":${phase.steps},\"phase_searches\":${phase.searches},\"phase_ignored\":${phase.ignored},\"phase_locked\":${phase.locked},\"phase_shift_ms\":%.2f,\"phase_cum_ms\":%.2f,\"phase_exact\":${phaseCtl?.lastExact ?: false},\"phase_carry\":${phaseCtl?.carry ?: 0},\"phase_fallback_off\":${phaseCtl?.fallbackOff ?: false},\"settle_mix\":%.2f,\"frame_ms\":%.3f,\"cam_gap_max_ms\":%.1f,\"frame_hold_max_ms\":%.1f,\"thermal\":$thermal,\"headroom\":%.2f,\"status\":$json}").format(java.util.Locale.ROOT, camFps, focusDiopters, phase.lastMoveMs, phase.cumulativeMs, phase.settleMix, phaseCtl?.frameMs ?: 0.0, gapMs, holdMs, headroom)
             android.util.Log.i("LensBolt", line)
             try {
                 val f = sessionLog ?: File(getExternalFilesDir("logs"), "session_${System.currentTimeMillis()}.jsonl").also { sessionLog = it }

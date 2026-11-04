@@ -173,10 +173,14 @@ class PhaseLock {
      *  measurement ends (a slow LCD panel leaves a narrow clean window: four steps of 8 ms, 06:48 on
      *  2026-11-03, took 29 s at the 6 s gap before the first byte; the file then read 96/96 at 4.5 Mbit/s). */
     private var everLocked = false
-    private fun canStep(now: Long): Boolean {
+    /** `inSearch`: the next step of a search under way (its last measurement failed). After a lock the gap holds only
+     *  between searches: a search's steps follow as each measurement ends (a lock lost to clock drift after 65 s
+     *  locked: the second step waited the 6 s gap with nothing read, phone 2026-11-05, and locked). The steps a
+     *  minute and the rests after failed measurements still bound it. */
+    private fun canStep(now: Long, inSearch: Boolean = false): Boolean {
         while (stepTimes.isNotEmpty() && now - stepTimes.first() >= 60_000L) stepTimes.removeFirst()
         if (!everLocked) return stepTimes.size < SEARCH_STEPS_PER_MIN
-        return (stepTimes.isEmpty() || now - stepTimes.last() >= STEP_GAP_MS) && stepTimes.size < STEPS_PER_MIN
+        return (inSearch || stepTimes.isEmpty() || now - stepTimes.last() >= STEP_GAP_MS) && stepTimes.size < STEPS_PER_MIN
     }
 
     private fun step(shift: Double, now: Long): Boolean { shiftMs = shift; steps++; stepTimes.addLast(now); at = now; state = State.STEP; return true }
@@ -235,7 +239,7 @@ class PhaseLock {
             }
             State.WAIT -> when {
                 locked || !allowed -> settle(now)
-                canStep(now) -> return step(pending, now)
+                canStep(now, inSearch = true) -> return step(pending, now)
             }
             State.OFF -> {}
         }

@@ -122,11 +122,26 @@ class CameraControlTest {
         while (r.t < 200_000) {
             if (r.poll(0.5)) { times += r.t; r.p.stepDone(8.0, r.t) }
         }
-        for (k in 1 until times.size) assertTrue("steps ${times[k - 1]} and ${times[k]}", times[k] - times[k - 1] >= PhaseLock.STEP_GAP_MS)
+        // a search's steps follow as each measurement ends (under the gap); the rests below space the searches
+        assertTrue("steps in one search ${times[0]}, ${times[1]}, ${times[2]}", times[1] - times[0] < PhaseLock.STEP_GAP_MS && times[2] - times[1] < PhaseLock.STEP_GAP_MS)
         for (k in times.indices) assertTrue(times.count { it in times[k] until times[k] + 60_000 } <= PhaseLock.STEPS_PER_MIN)
         // after 3 steps a rest of 20 s, after the next 3 one of 40 s
         assertTrue("first rest ${times[3] - times[2]}", times[3] - times[2] >= 20_000)
         assertTrue("second rest ${times[6] - times[5]}", times[6] - times[5] >= 40_000)
+    }
+
+    // a lock lost (the camera's and the screen's clocks drift: a blend came back after 65 s locked) searches again
+    // as it measures: the second step follows the first's failed measurement, not the 6 s gap (phone, 2026-11-05:
+    // steps at +77.2 and +83.4 s, nothing read in between; the second step locked)
+    @Test fun aLostLockSearchStepsAsItMeasures() {
+        val r = Run(PhaseLock())
+        repeat(40) { r.poll(0.0, whole = true) }
+        assertTrue(r.p.locked)
+        val times = ArrayList<Long>()
+        val t1 = r.t
+        while (r.t < t1 + 15_000 && times.size < 2) { if (r.poll(0.5)) { times += r.t; r.p.stepDone(8.0, r.t) } }
+        assertEquals("two steps in 15 s", 2, times.size)
+        assertTrue("second step ${times[1] - times[0]} ms after the first", times[1] - times[0] < 2_500)
     }
 
     // never a step while locked on; locked holds through a 0.25 mean, a second over 0.3 unlocks (then a step)
