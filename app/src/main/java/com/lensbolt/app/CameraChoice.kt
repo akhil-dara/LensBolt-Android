@@ -67,3 +67,33 @@ class StreamChange {
     /** A frame of binding `bind`: true once, for the first frame of the awaited binding. */
     fun frame(bind: Int): Boolean = awaited.get() == bind && awaited.compareAndSet(bind, -1)
 }
+
+/** A back lens the app can open: its camera id and nearest focus in diopters (0: fixed focus, not reported). */
+data class Lens(val id: String, val nearestDiopters: Float)
+
+/** Which back lens reads: the default back camera until its picture shows the phone nearer than it focuses (big
+ *  soft cells, [Guidance.softAndBig]) for [SOFT_MS]; then the lens that focuses nearest, when it focuses at least
+ *  [CLOSER_BY] times as near. A small sender (a phone's screen) is read up close: a phone's main lens focuses
+ *  no nearer than 13 cm, where a phone sender's cells read soft, and its ultrawide focuses at 4.1 cm (Chrome reads the
+ *  same tile with it at 4-5 cm, 2026-11-04). Phones without a nearer lens keep the default and say "move back".
+ *  [lens] null: the default back camera. */
+class LensChoice {
+    companion object { const val SOFT_MS = 600L; const val CLOSER_BY = 2.0f }
+    var lens: String? = null
+        private set
+    private var softSince = -1L
+
+    fun reset() { lens = null; softSince = -1L }
+
+    /** One data read at `now`: whether it showed big soft cells, the bound lens, the back lenses there are. The lens
+     *  to switch to, or null. */
+    fun observe(softBig: Boolean, now: Long, bound: Lens, lenses: List<Lens>): String? {
+        if (!softBig) { softSince = -1L; return null }
+        if (softSince < 0) softSince = now
+        if (now - softSince < SOFT_MS || bound.nearestDiopters <= 0f) return null
+        val nearer = lenses.filter { it.id != bound.id && it.nearestDiopters >= bound.nearestDiopters * CLOSER_BY }
+            .maxByOrNull { it.nearestDiopters } ?: return null
+        lens = nearer.id; softSince = -1L
+        return nearer.id
+    }
+}

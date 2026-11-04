@@ -87,7 +87,7 @@ class CameraControlTest {
     }
 
     // steps at least 6 s apart and at most 5 a minute; three failing steps in a row rest 20 s, then 40 s
-    // before the first lock the search steps as each measurement ends (a MacBook's narrow clean window took
+    // before the first lock the search steps as each measurement ends (a slow panel's narrow clean window took
     // four steps: 29 s at the 6 s gap, 06:48 on 2026-11-03), up to 12 a minute, without resting
     @Test fun theSearchBeforeTheFirstLockStepsAsItMeasures() {
         val r = Run(PhaseLock())
@@ -365,5 +365,38 @@ class CameraControlTest {
         assertTrue("steps in 30 s: $stepsIn30", stepsIn30 <= 2)
         assertTrue("locked at $lockedAt ms", lockedAt in 0.0..20_000.0)
         assertEquals(8, ctl.carry)
+    }
+
+    // the start's focus scan: one scan, then continuous focus gets its own window before another (a scan every
+    // 1.5 s with a 2 s auto-cancel kept the lens in one-shot scans, stuck at 10 m: 2026-11-03 phone log)
+    @Test fun focus_kick_leaves_continuous_focus_a_window_between_scans() {
+        val k = FocusKick()
+        assertTrue(k.update(0, seen = false, locked = false, sharpness = 7.0))
+        assertFalse(k.update(1500, seen = false, locked = false, sharpness = 7.0))
+        assertFalse(k.update(FocusKick.EVERY_MS - 1, seen = false, locked = false, sharpness = 7.0))
+        assertTrue(k.update(FocusKick.EVERY_MS, seen = false, locked = false, sharpness = 7.0))
+        assertTrue(FocusKick.EVERY_MS >= FocusKick.SCAN_MS + 3000)
+    }
+
+    @Test fun focus_kick_gives_up_after_a_few_scans_until_something_is_seen() {
+        val k = FocusKick(); val e = FocusKick.EVERY_MS
+        for (n in 0 until FocusKick.MAX_KICKS) assertTrue(k.update(n * e, seen = false, locked = false, sharpness = 7.0))
+        assertFalse(k.update(FocusKick.MAX_KICKS * e, seen = false, locked = false, sharpness = 7.0))
+        assertFalse(k.update(FocusKick.MAX_KICKS * e + 100, seen = true, locked = false, sharpness = 7.0))
+        assertTrue(k.update((FocusKick.MAX_KICKS + 2) * e, seen = false, locked = false, sharpness = 7.0))
+    }
+
+    @Test fun focus_kick_never_scans_a_sharp_picture_a_seen_tile_or_a_lock() {
+        val k = FocusKick()
+        assertFalse(k.update(0, seen = false, locked = false, sharpness = 40.0))
+        assertFalse(k.update(10, seen = true, locked = false, sharpness = 7.0))
+        assertFalse(k.update(20, seen = false, locked = true, sharpness = 7.0))
+    }
+
+    @Test fun focus_kick_waits_after_the_users_tap() {
+        val k = FocusKick()
+        k.scanned(1000)
+        assertFalse(k.update(2500, seen = false, locked = false, sharpness = 7.0))
+        assertTrue(k.update(1000 + FocusKick.EVERY_MS, seen = false, locked = false, sharpness = 7.0))
     }
 }

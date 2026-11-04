@@ -10,13 +10,16 @@ use lensbolt_core::flat::live::{Capture, LiveConfig, LiveReceiver};
 use lensbolt_core::image::{GrayImage, RgbImage};
 use std::path::PathBuf;
 
-fn plane(env: &JNIEnv, buf: &JByteBuffer) -> Option<Vec<u8>> {
+/// The camera plane behind a direct ByteBuffer, borrowed: valid until the analyzer closes the image (after
+/// `submit` returns), so anything kept is copied out before then.
+fn plane_ref<'a>(env: &JNIEnv, buf: &JByteBuffer) -> Option<&'a [u8]> {
     let ptr = env.get_direct_buffer_address(buf).ok()?;
     let len = env.get_direct_buffer_capacity(buf).ok()?;
     if ptr.is_null() || len == 0 { return None; }
     // SAFETY: a direct ByteBuffer of the camera image, valid until the analyzer closes the image (after we return)
-    Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
+fn plane(env: &JNIEnv, buf: &JByteBuffer) -> Option<Vec<u8>> { plane_ref(env, buf).map(|p| p.to_vec()) }
 
 #[no_mangle]
 pub extern "system" fn Java_com_lensbolt_app_Native_create(mut env: JNIEnv, _: JClass, out_dir: JString, workers: jint) -> jlong {
@@ -41,11 +44,26 @@ pub extern "system" fn Java_com_lensbolt_app_Native_submit(
     let live = unsafe { &*(handle as *const LiveReceiver) };
     if !live.has_room() { live.skip(); return JNI_FALSE; }
     let (w, h, yr, ur, px) = (width as u32, height as u32, y_row as usize, uv_row as usize, uv_pixel as usize);
+    // while the tile is tracked and no colour is wanted, only its region of Y is copied (a whole full-sensor
+    // plane costs several ms here on the camera's thread; the region well under one)
+    let chroma = live.want_chroma();
+    if !chroma {
+        if let Some([x0, y0, x1, y1]) = live.crop_rect(w, h) {
+            let Some(src) = plane_ref(&env, &y) else { live.skip(); return JNI_FALSE };
+            if src.len() < yr * (h as usize - 1) + w as usize { live.skip(); return JNI_FALSE; }
+            let (cw, ch) = ((x1 - x0) as usize, (y1 - y0) as usize);
+            let mut data = Vec::with_capacity(cw * ch);
+            for row in y0 as usize..y1 as usize { let o = row * yr + x0 as usize; data.extend_from_slice(&src[o..o + cw]); }
+            let crop = GrayImage { width: cw as u32, height: ch as u32, data };
+            let ok = live.submit_capture(move || Capture { y: crop, rgb: None, origin: (x0, y0) });
+            return if ok { JNI_TRUE } else { JNI_FALSE };
+        }
+    }
     // every offered capture is counted: one that cannot be copied is a drop
     let Some(yp) = plane(&env, &y) else { live.skip(); return JNI_FALSE };
     if yp.len() < yr * (h as usize - 1) + w as usize { live.skip(); return JNI_FALSE; }
     // decided before the copy: the analyzer closes the image once we return
-    let uv = if live.want_chroma() {
+    let uv = if chroma {
         let (Some(up), Some(vp)) = (plane(&env, &u), plane(&env, &v)) else { live.skip(); return JNI_FALSE };
         Some((up, vp))
     } else { None };
@@ -53,7 +71,7 @@ pub extern "system" fn Java_com_lensbolt_app_Native_submit(
     let ok = live.submit_capture(move || {
         let y = GrayImage::from_plane(w, h, &yp, yr);
         let rgb = uv.map(|(up, vp)| Box::new(move || RgbImage::from_yuv420(w, h, &yp, yr, &up, &vp, ur, px)) as Box<dyn FnOnce() -> RgbImage + Send>);
-        Capture { y, rgb }
+        Capture { y, rgb, origin: (0, 0) }
     });
     if ok { JNI_TRUE } else { JNI_FALSE }
 }

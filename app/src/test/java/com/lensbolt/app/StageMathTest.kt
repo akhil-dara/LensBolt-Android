@@ -39,12 +39,12 @@ class StageMathTest {
         assertNotNull(cols(640, 360))                               // a 360x640 phone turned: the guide moves left
         assertNotNull(cols(660, 371))
         assertNotNull(cols(900, 405))
-        // the OnePlus 12 at its default size, landscape with the cutout inset: columns, Details in the left band
+        // a large phone at its default size, landscape with the cutout inset: columns, Details in the left band
         val c = StageMath.columns((914 * d).toInt(), (411 * d).toInt(), (32 * d).toInt(), 0, aspect, d)
         assertNotNull(c); assertTrue(!c!!.detailsInColumn)
     }
 
-    // portrait phones from 360x640 dp to the OnePlus 12 (411x914 dp), status and navigation insets of every
+    // portrait phones from 360x640 dp to a large phone (411x914 dp), status and navigation insets of every
     // kind, the top bar at its height and taller (font scale 1.3): the guide is under the top bar (on the
     // smallest phones with the tallest bars it may move up under the bar), the band for every panel is under the guide, inside the window and at least 96 dp tall (panels scroll inside it, so a
     // larger font never pushes one over the guide)

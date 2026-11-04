@@ -10,6 +10,92 @@ class GuidanceTest {
         Reading(fresh, failure, pitch, bw, cellPx, edges, ok, all, receiving)
 
     // the lock (the blue line): the tile read without a gap for 0.5 s and a codeword decoded in the last 10 reads
+    // too close to focus: the lens at its nearest and the autofocus not focused for 0.8 s (a phone's main
+    // camera focuses no nearer than 13 cm: a phone sender held at 8 cm never sharpens); a sharp picture at the
+    // nearest setting, a lens short of it, or a scan in progress are not
+    // the phone log (2026-11-03, a phone sender at about 8 cm): the lens parked at 14.29 D, autofocus between a scan
+    // (1) and not focused (5) every second, 0 of 49 codewords; the scans in between must not restart the watch
+    // a phone camera reports its lens at the nearest end (14.29 D) and not focused even while the tile reads 49 of
+    // 49 codewords (2026-11-03): one whole read there shows this camera's report cannot be trusted, and the hint
+    // stays off (it said "move back" over sharp captures and over cells too small to read)
+    // nearer than the lens focuses, seen in the picture itself (2026-11-04, a phone at 4096x3072 reading a
+    // phone sender's 2 px tile): at 8 cm the cells measured 4.1 px with edges of 5.8-7.9 px and read 0-102 of 111; at
+    // 15 cm, 2.8 px cells with 3.5 px edges read 111 of 111. Big cells with edges wider than [Guidance.SOFT_RATIO]
+    // of a cell: move back, whatever the lens reports
+    // a blend the measure under-reports: a session log (2026-11-04) read 99 -> 31-36 of 111 codewords for 5 s with the
+    // border sharp, the cells big enough and the measured blend 0.0-0.1; the phase step waited until reads fell under a
+    // fifth (18 of 111), then one step brought 111 back. Under half, sharp and big enough is a blend
+    @Test fun sharp_big_enough_cells_reading_under_half_are_a_blend() {
+        assertEquals(true, Guidance.blendSuspected(ok = 31, all = 111, cellPx = 1.86, edgePx = 1.83, pitch = 2, bw = true))
+        assertEquals(true, Guidance.blendSuspected(ok = 18, all = 111, cellPx = 1.86, edgePx = 1.83, pitch = 2, bw = true))
+        assertEquals(false, Guidance.blendSuspected(ok = 96, all = 111, cellPx = 1.86, edgePx = 1.83, pitch = 2, bw = true))
+        // soft edges or cells under the floor: not a blend (focus, distance), the phase must not step for them
+        assertEquals(false, Guidance.blendSuspected(ok = 31, all = 111, cellPx = 1.86, edgePx = 3.0, pitch = 2, bw = true))
+        assertEquals(false, Guidance.blendSuspected(ok = 31, all = 111, cellPx = 1.3, edgePx = 1.83, pitch = 2, bw = true))
+        assertEquals(false, Guidance.blendSuspected(ok = 0, all = 0, cellPx = 1.86, edgePx = 1.83, pitch = 2, bw = true))
+    }
+
+    @Test fun big_soft_cells_say_move_back() {
+        val near = Reading(true, null, 2, true, 4.1, square, 5, 111, true, edgePx = 6.3)
+        assertEquals(Hints.TOO_CLOSE, Guidance.hint(near))
+        // the same cells sharp: reading, not too close
+        assertEquals(Hints.GOOD, Guidance.hint(near.copy(codewordsOk = 111, edgePx = 3.5)))
+        // soft cells that are small: too far or simply soft, never "move back"
+        val small = Reading(true, null, 2, true, 1.8, square, 0, 111, true, edgePx = 2.6)
+        assertEquals(false, Guidance.hint(small) == Hints.TOO_CLOSE)
+        // 15 cm at Max: comfortable cells, edges under the ratio, reading
+        assertEquals(Hints.GOOD, Guidance.hint(Reading(true, null, 2, true, 2.8, square, 111, 111, true, edgePx = 3.5)))
+    }
+
+    @Test fun a_whole_read_at_the_nearest_end_silences_the_watch() {
+        val w = TooCloseWatch()
+        assertEquals(false, w.update(now = 0, afState = 5, focusDiopters = 14.29f, minDiopters = 7.69f, readsWell = true))
+        assertEquals(false, w.update(now = 900, afState = 5, focusDiopters = 14.29f, minDiopters = 7.69f))
+        assertEquals(false, w.update(now = 5000, afState = 5, focusDiopters = 14.29f, minDiopters = 7.69f))
+        // a new camera: trusted again
+        w.reset()
+        assertEquals(false, w.update(now = 6000, afState = 5, focusDiopters = 14.29f, minDiopters = 7.69f))
+        assertEquals(true, w.update(now = 6900, afState = 5, focusDiopters = 14.29f, minDiopters = 7.69f))
+    }
+
+    @Test fun too_close_counts_scans_at_the_nearest_end_as_unfocused() {
+        val w = TooCloseWatch()
+        assertEquals(false, w.update(now = 0, afState = 1, focusDiopters = 14.29f, minDiopters = 7.69f))
+        assertEquals(false, w.update(now = 400, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 14.29f, minDiopters = 7.69f))
+        assertEquals(true, w.update(now = 900, afState = 1, focusDiopters = 14.29f, minDiopters = 7.69f))
+    }
+
+    @Test fun too_close_to_focus_needs_the_lens_at_its_nearest_and_no_focus() {
+        val min = 7.69f
+        val w = TooCloseWatch()
+        assertEquals(false, w.update(now = 0, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 7.6f, minDiopters = min))
+        assertEquals(false, w.update(now = 700, afState = TooCloseWatch.AF_PASSIVE_UNFOCUSED, focusDiopters = 7.69f, minDiopters = min))
+        assertEquals(true, w.update(now = 800, afState = TooCloseWatch.AF_PASSIVE_UNFOCUSED, focusDiopters = 7.69f, minDiopters = min))
+        // focused there after all: off once it has been so for 1.5 s (not at once: the scan between)
+        assertEquals(true, w.update(now = 1000, afState = TooCloseWatch.AF_PASSIVE_FOCUSED, focusDiopters = 7.69f, minDiopters = min))
+        assertEquals(false, w.update(now = 2600, afState = TooCloseWatch.AF_PASSIVE_FOCUSED, focusDiopters = 7.69f, minDiopters = min))
+        // the lens well short of its nearest: never, focused or not
+        val v = TooCloseWatch()
+        assertEquals(false, v.update(now = 0, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 5f, minDiopters = min))
+        assertEquals(false, v.update(now = 2000, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 5f, minDiopters = min))
+        // a fixed-focus camera (no minimum reported): never
+        val f = TooCloseWatch()
+        assertEquals(false, f.update(now = 0, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 0f, minDiopters = 0f))
+        assertEquals(false, f.update(now = 2000, afState = TooCloseWatch.AF_NOT_FOCUSED_LOCKED, focusDiopters = 0f, minDiopters = 0f))
+    }
+
+    @Test fun too_close_says_move_back_never_move_closer() {
+        // the cells read small (it would say Move closer) but the camera cannot focus this near: Move back
+        val small = Reading(true, null, 2, true, 1.29, square, 0, 111, true, tooClose = true)
+        assertEquals(Hints.TOO_CLOSE, Guidance.hint(small))
+        // not fresh: the frames blurred (TooBlurry): Move back too
+        assertEquals(Hints.TOO_CLOSE, Guidance.hint(Reading(false, "TooBlurry(2.1)", 2, true, 0.0, square, 0, 0, true, tooClose = true)))
+        // reading well: nothing to say
+        assertEquals(Hints.GOOD, Guidance.hint(Reading(true, null, 3, true, 2.3, square, 49, 49, true, tooClose = true)))
+        // not too close: Move closer as before
+        assertEquals(Hints.CLOSER, Guidance.hint(Reading(true, null, 2, true, 1.29, square, 0, 111, true)))
+    }
+
     @Test fun locked_needs_half_a_second_of_tracking_and_a_codeword() {
         val w = LockWatch()
         assertEquals(false, w.update(fresh = true, newReads = 1, codewordsOk = 4, now = 0))

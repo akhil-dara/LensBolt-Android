@@ -154,7 +154,7 @@ class PhaseLock {
     fun reset() {
         cameraChanged(); state = State.WATCH; steps = 0; searches = 0; ignored = 0; anyMoved = false
         restUntil = -1L; restLevel = 0; fails = 0; settleMix = -1.0; stepTimes.clear()
-        // a new transfer searches afresh (the second transfer of an app session on the MacBook, 07:15: three steps
+        // a new transfer searches afresh (the second transfer of an app session on a laptop, 07:15: three steps
         // at the 6 s gap again, 17 s to the first byte)
         everLocked = false
     }
@@ -170,7 +170,7 @@ class PhaseLock {
     fun takeRestore(): Boolean { val r = restore; restore = false; return r }
 
     /** Whether the phase ever locked this session: until it has, the search runs step after step as each
-     *  measurement ends (a MacBook's slow panel leaves a narrow clean window: four steps of 8 ms, 06:48 on
+     *  measurement ends (a slow LCD panel leaves a narrow clean window: four steps of 8 ms, 06:48 on
      *  2026-11-03, took 29 s at the 6 s gap before the first byte; the file then read 96/96 at 4.5 Mbit/s). */
     private var everLocked = false
     private fun canStep(now: Long): Boolean {
@@ -419,4 +419,29 @@ class PhaseController(private val cam: PhaseCamera, private val exactSupported: 
 
     /** The finished step's measured move, once. */
     fun takeResult(): Double? = synchronized(lock) { val r = result; result = null; r }
+}
+
+/** The start's focus scan: continuous focus can sit soft on a screen for seconds, so while nothing is seen and the
+ *  picture is soft, one active scan at the centre ([SCAN_MS], auto-cancelled back to continuous). The next one
+ *  waits [EVERY_MS], so continuous focus gets [EVERY_MS] - [SCAN_MS] of its own between scans; after [MAX_KICKS]
+ *  scans with nothing seen it is left alone until a tile has been seen. (A scan every 1.5 s against a 2 s
+ *  auto-cancel never let continuous focus back: the lens stayed in one-shot scans, stuck at 10 m.) */
+class FocusKick {
+    companion object { const val SOFT_BELOW = 15.0; const val SCAN_MS = 2000L; const val EVERY_MS = 6000L; const val MAX_KICKS = 3 }
+    private var lastAt = Long.MIN_VALUE
+    private var kicks = 0
+
+    @Synchronized fun reset() { lastAt = Long.MIN_VALUE; kicks = 0 }
+
+    /** A scan started elsewhere (the user's tap): the next kick waits [EVERY_MS] from it, so none cuts it short. */
+    @Synchronized fun scanned(now: Long) { lastAt = now }
+
+    /** One poll: true when a scan starts now. */
+    @Synchronized fun update(now: Long, seen: Boolean, locked: Boolean, sharpness: Double): Boolean {
+        if (seen) { kicks = 0; return false }
+        if (locked || sharpness >= SOFT_BELOW || kicks >= MAX_KICKS) return false
+        if (lastAt != Long.MIN_VALUE && now - lastAt < EVERY_MS) return false
+        lastAt = now; kicks++
+        return true
+    }
 }

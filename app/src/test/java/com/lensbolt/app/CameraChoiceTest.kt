@@ -16,6 +16,17 @@ class CameraChoiceTest {
         return at
     }
 
+    // Max is no longer offered (2026-11-04: a laptop's tile at 4096x3072 ran the camera at 3-4 fps
+    // with decodes of 0.5-1.2 s, against 30 fps and 35-44 ms at Full HD): the menu offers Auto and Full HD, and a
+    // saved Max loads as Auto
+    @Test fun the_menu_offers_auto_and_full_hd_and_a_saved_max_loads_as_auto() {
+        assertEquals(listOf(CameraMode.AUTO, CameraMode.FULL_HD), CameraMode.MENU)
+        assertEquals(CameraMode.AUTO, CameraMode.fromSaved("MAX"))
+        assertEquals(CameraMode.FULL_HD, CameraMode.fromSaved("FULL_HD"))
+        assertEquals(CameraMode.AUTO, CameraMode.fromSaved(null))
+        assertEquals(CameraMode.AUTO, CameraMode.fromSaved("nonsense"))
+    }
+
     @Test fun starts_at_full_hd() {
         assertEquals(Tier.FULL_HD, CameraChoice().tier)
     }

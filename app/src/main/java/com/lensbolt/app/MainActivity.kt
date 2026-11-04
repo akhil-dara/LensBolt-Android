@@ -66,7 +66,10 @@ import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity(), ScreenHost {
     private companion object {
-        val FULL_HD = Size(1920, 1080)          // resolves to the 1440x1080 class (4:3) on the phones measured
+        // 16:9: the square tile is read across the picture's short side, and 1080 px there span three quarters of
+        // the sensor (4:3's 1080 span all of it): a third more camera px per cell at the same distance, as
+        // Chrome reads it (1920x1080; the app's 4:3 request gave 1440x1080)
+        val FULL_HD = Size(1920, 1080)
         const val VERSION_BANNER_KEY = -1        // the banner's key for the other-version words (fps keys are rates)
         const val BANNER_HOLD_MS = 2000L        // the sender-fps banner outlives its condition (ledger ruling)
         const val HINT_HOLD_MS = 600L           // a new guidance line must hold this long before it shows
@@ -107,6 +110,10 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     // camera mode: Auto is Full HD except for 1 px tiles (CameraChoice); the menu forces one
     private var mode = CameraMode.AUTO
     private val choice = CameraChoice()
+    // which back lens reads (LensChoice), the back lenses there are and the one bound
+    private val lensChoice = LensChoice()
+    private var lenses: List<Lens> = emptyList()
+    private var boundLens: Lens? = null
     private var maxSize: Size? = null      // the largest 4:3 YUV stream of the back camera (looked up once)
     private var boundTier: Tier? = null
     private var camSize = ""
@@ -153,17 +160,17 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     // the camera's phase against the sender's panel (PhaseLock): one longer frame moves the captures out of the
     // panel's settling window; `slowFps` the slower rate of the fallback step (null: none offered)
     private val phase = PhaseLock()
-    /** the last active focus scan asked for while nothing was seen (the start), and its rule: the sharpness gate
-     *  score under which, with no tile seen, the camera gets one, at most this often */
-    private var focusKickAt = 0L
-    private val FOCUS_KICK_BELOW = 15.0
-    private val FOCUS_KICK_GAP_MS = 1500L
+    // the start's focus scan while nothing is seen and the picture is soft (FocusKick)
+    private val focusKick = FocusKick()
     /** the sender's rate within PhaseLock.RATE_MATCH of the camera's on the last poll (the guidance reads it) */
     private var phaseRatesMatch = false
     private var slowFps: Range<Int>? = null
     // the lens and sensor as the last capture result reported them (lab log, Details)
     @Volatile private var afState = -1
     @Volatile private var focusDiopters = 0f
+    // the bound camera's nearest focus (diopters; 0 fixed focus) and whether the phone is nearer than that
+    private var minFocusDiopters = 0f
+    private val tooClose = TooCloseWatch()
     @Volatile private var resultExpNs = 0L
     @Volatile private var resultIso = 0
     // the phase step's measured move: while a step runs, the capture timestamps' gaps beyond the camera's own frame
@@ -208,7 +215,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     // consecutive frames instead (up to 400, for an end-to-end replay); no effect otherwise
     @Volatile private var dumpLeft = 0
     // exposure: a screen in a dark room makes auto exposure clip the screen's colours (white, yellow and pink
-    // merge; measured on a OnePlus 12, 0/83 codewords). Every few frames the Y plane is sampled; compensation
+    // merge; measured on a phone, 0/83 codewords). Every few frames the Y plane is sampled; compensation
     // steps down while > 0.5% of samples clip, up while the brightest 1% sits below 200.
     private var camera: androidx.camera.core.Camera? = null
     private var evIndex = 0
@@ -246,7 +253,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         if (!lab) { val app = applicationContext; ioExec.execute { Storage.purgeLabFiles(app) } }
         // a real start only: a recreated activity may be about to receive a folder picker's result
         if (savedInstanceState == null) ioExec.execute { sweepTrees() }
-        mode = runCatching { CameraMode.valueOf(prefs.getString("cameraMode", "AUTO")!!) }.getOrDefault(CameraMode.AUTO)
+        mode = CameraMode.fromSaved(prefs.getString("cameraMode", null))
         detailsOn = prefs.getBoolean("details", false)
         preview = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FIT_CENTER; implementationMode = PreviewView.ImplementationMode.COMPATIBLE }
         screen = ReceiverScreen(this, preview, this)
@@ -318,7 +325,9 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQ_CAMERA) return
-        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startCamera() else show(permissionState())
+        val ok = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+        prefs.edit().putBoolean("cameraBlocked", CameraPermission.blockedAfter(ok, ActivityCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA))).apply()
+        if (ok) startCamera() else show(permissionState())
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -365,7 +374,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
 
     override fun onAction(a: Action) {
         when (a) {
-            Action.GRANT -> { prefs.edit().putBoolean("askedCamera", true).apply(); ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA) }
+            Action.GRANT -> ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             Action.SETTINGS -> try {
                 startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
             } catch (_: ActivityNotFoundException) {}
@@ -396,6 +405,20 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         if (tier() != boundTier) bindCamera()
     }
 
+    /** Tap to focus: CameraX's focus at the preview point (its factory maps the FIT_CENTER picture and the
+     *  rotation), autofocus only (the exposure stays the app's), released after 3 s to continuous; a held focus
+     *  lock lets go first. */
+    override fun onTapFocus(x: Float, y: Float, done: (Boolean) -> Unit) {
+        val c = camera?.cameraControl ?: return done(false)
+        if (focusLock.reset()) c.cancelFocusAndMetering()
+        focusKick.scanned(SystemClock.elapsedRealtime())
+        val f = try {
+            val point = preview.meteringPointFactory.createPoint(x, y)
+            c.startFocusAndMetering(FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF).setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS).build())
+        } catch (_: Throwable) { return done(false) }
+        f.addListener({ done(try { f.get().isFocusSuccessful } catch (_: Throwable) { false }) }, ContextCompat.getMainExecutor(this))
+    }
+
     override fun onDetails(on: Boolean) {
         detailsOn = on
         prefs.edit().putBoolean("details", on).apply()
@@ -404,9 +427,12 @@ class MainActivity : AppCompatActivity(), ScreenHost {
 
     private fun granted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
-    // permanently denied: asked before and Android no longer shows its dialog (only Settings can turn it on)
-    private fun permissionState() = UiState.Permission(
-        prefs.getBoolean("askedCamera", false) && !ActivityCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA))
+    // permanently denied: a request came back refused with no rationale (CameraPermission; only Settings can turn
+    // it on). A grant clears it, so a one-time grant that expired asks again
+    private fun permissionState(): UiState.Permission {
+        if (granted()) prefs.edit().putBoolean("cameraBlocked", false).apply()
+        return UiState.Permission(CameraPermission.showSettings(prefs.getBoolean("cameraBlocked", false)))
+    }
 
     // ---- session -------------------------------------------------------------------------------------------
 
@@ -460,6 +486,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     // ---- camera --------------------------------------------------------------------------------------------
 
     private fun startCamera() {
+        prefs.edit().putBoolean("cameraBlocked", false).apply()
         if (doneFile == null && stopped == null) show(UiState.Aim(Hints.SEARCH))
         if (provider != null) { bindCamera(); return }
         val future = ProcessCameraProvider.getInstance(this)
@@ -476,10 +503,33 @@ class MainActivity : AppCompatActivity(), ScreenHost {
 
     private fun rotation() = preview.display?.rotation ?: Surface.ROTATION_0
 
+    /** The camera that reads: the lens [LensChoice] picked, else the default back camera. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun backInfo(provider: ProcessCameraProvider): androidx.camera.core.CameraInfo {
+        val id = lensChoice.lens
+        if (id != null) provider.availableCameraInfos.firstOrNull { Camera2CameraInfo.from(it).cameraId == id }?.let { return it }
+        return provider.availableCameraInfos.first { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() }
+    }
+    /** The selector of [backInfo]. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun backSelector(): CameraSelector {
+        val id = lensChoice.lens ?: return CameraSelector.DEFAULT_BACK_CAMERA
+        return CameraSelector.Builder().addCameraFilter { infos -> infos.filter { Camera2CameraInfo.from(it).cameraId == id } }.build()
+    }
+    /** The back lenses the app can open, with their nearest focus. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun backLenses(provider: ProcessCameraProvider): List<Lens> = try {
+        provider.availableCameraInfos.mapNotNull { i ->
+            val c = Camera2CameraInfo.from(i)
+            if (c.getCameraCharacteristic(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) null
+            else Lens(c.cameraId, c.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f)
+        }
+    } catch (_: Throwable) { emptyList() }
+
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun largest43(provider: ProcessCameraProvider): Size {
         return try {
-            val info = provider.availableCameraInfos.first { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() }
+            val info = backInfo(provider)
             val map = Camera2CameraInfo.from(info).getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888).orEmpty()
             (sizes.filter { it.width.toLong() * 3 == it.height.toLong() * 4 }.ifEmpty { sizes.toList() })
@@ -492,7 +542,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
      *  adds 8.3 ms), else the fastest such range whose top is under 30; null when none (exact steps only). */
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun slowRange(provider: ProcessCameraProvider): Range<Int>? = try {
-        val info = Camera2CameraInfo.from(provider.availableCameraInfos.first { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() })
+        val info = Camera2CameraInfo.from(backInfo(provider))
         val period = 1000.0 / 30
         val ranges = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
             .filter { it.upper in 15..29 && phaseShift(1000.0 / it.upper - period, period) >= 3.0 }
@@ -503,7 +553,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
      *  modes; with its sensitivity range (to clamp the copied ISO). */
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun exactSupport(provider: ProcessCameraProvider): Pair<Boolean, Range<Int>?> = try {
-        val info = Camera2CameraInfo.from(provider.availableCameraInfos.first { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() })
+        val info = Camera2CameraInfo.from(backInfo(provider))
         val manual = info.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
         val aeOff = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)?.contains(CameraCharacteristics.CONTROL_AE_MODE_OFF) == true
         (manual && aeOff) to info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
@@ -526,6 +576,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val target = if (t == Tier.MAX) big else FULL_HD
         val selector = ResolutionSelector.Builder()
             .setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER))
+            .setAspectRatioStrategy(if (t == Tier.MAX) AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
             .build()
         val builder = ImageAnalysis.Builder()
@@ -549,7 +600,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val (exactOk, isoR) = exactSupport(provider)
         isoRange = isoR
         // how many frames this camera carries an exact request on, as learnt before (0: a probe first)
-        val camId = try { Camera2CameraInfo.from(provider.availableCameraInfos.first { CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(it)).isNotEmpty() }).cameraId } catch (_: Throwable) { "back" }
+        val camId = try { Camera2CameraInfo.from(backInfo(provider)).cameraId } catch (_: Throwable) { "back" }
         phaseCtl = PhaseController(phaseCamera, exactOk, prefs.getInt("phaseCarry_$camId", 0)) { c -> prefs.edit().putInt("phaseCarry_$camId", c).apply() }
         // the lens and sensor state per capture, for the lab log and Details
         Camera2Interop.Extender(builder).setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
@@ -574,14 +625,23 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         analysis.setAnalyzer(analyzerExec) { onFrame(it, bind) }
         // the preview at 4:3 like the analysis: the framing guide then marks what the decoder sees
         val prev = Preview.Builder()
-            .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build())
+            .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(if (t == Tier.MAX) AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY).build())
             .setTargetRotation(rotation())
             .build().also { it.surfaceProvider = preview.surfaceProvider }
         try {
             provider.unbindAll()
             camera?.cameraInfo?.cameraState?.removeObservers(this)
-            val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, prev, analysis)
+            val cam = try { provider.bindToLifecycle(this, backSelector(), prev, analysis) } catch (t: Throwable) {
+                // the chosen lens would not open: the default back camera, and no lens choice for this run
+                if (lensChoice.lens == null) throw t
+                lensChoice.reset(); provider.unbindAll(); provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, prev, analysis)
+            }
             camera = cam; previewUse = prev; boundTier = t
+            if (Storage.labOn(this)) logCameras(provider, cam)
+            minFocusDiopters = try { Camera2CameraInfo.from(cam.cameraInfo).getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f } catch (_: Throwable) { 0f }
+            lenses = backLenses(provider)
+            boundLens = try { Lens(Camera2CameraInfo.from(cam.cameraInfo).cameraId, minFocusDiopters) } catch (_: Throwable) { null }
+            tooClose.reset(); focusKick.reset()
             screen.setPreviewLive(true)
             cam.cameraControl.setExposureCompensationIndex(evIndex)
             if (focusLock.reset()) cam.cameraControl.cancelFocusAndMetering()
@@ -632,7 +692,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val json = sessions.withHandle { h -> if (h == 0L) "{}" else Native.status(h) }
         val s = try { JSONObject(json) } catch (_: Throwable) { return }
         if (lab && logTick % 5 == 0) {
-            val line = ("{\"wall_ms\":${System.currentTimeMillis()},\"camera\":\"$camSize\",\"camera_fps\":%.1f,\"ev\":$evIndex," +
+            val line = ("{\"wall_ms\":${System.currentTimeMillis()},\"camera\":\"$camSize\",\"lens\":\"${boundLens?.id ?: "?"}\",\"camera_fps\":%.1f,\"ev\":$evIndex," +
                 "\"exposure_ns\":$resultExpNs,\"iso\":$resultIso,\"af_state\":$afState,\"focus_diopters\":%.2f,\"focus_locked\":${focusLock.locked},\"focus_failed\":${focusLock.failedLocks},\"phase\":\"${phase.state}\",\"phase_steps\":${phase.steps},\"phase_searches\":${phase.searches},\"phase_ignored\":${phase.ignored},\"phase_locked\":${phase.locked},\"phase_shift_ms\":%.2f,\"phase_cum_ms\":%.2f,\"phase_exact\":${phaseCtl?.lastExact ?: false},\"phase_carry\":${phaseCtl?.carry ?: 0},\"phase_fallback_off\":${phaseCtl?.fallbackOff ?: false},\"settle_mix\":%.2f,\"frame_ms\":%.3f,\"status\":$json}").format(java.util.Locale.ROOT, camFps, focusDiopters, phase.lastMoveMs, phase.cumulativeMs, phase.settleMix, phaseCtl?.frameMs ?: 0.0)
             android.util.Log.i("LensBolt", line)
             try {
@@ -683,15 +743,12 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             FocusLock.Act.UNLOCK -> camera?.cameraControl?.cancelFocusAndMetering()
             FocusLock.Act.NONE -> {}
         }
-        // the start: continuous focus can sit soft on a screen for seconds (the first captures of a session at
-        // sharpness 7-8 against 37-60 once reading, no markers found, 2026-11-03): while nothing is seen and the
-        // picture is soft, an active focus scan at the centre, at most every 1.5 s (auto-cancelled: continuous
-        // focus goes on afterwards; FocusLock's own lock is untouched)
-        if (!fresh && !focusLock.locked && s.optDouble("sharpness", 0.0) < FOCUS_KICK_BELOW && now - focusKickAt >= FOCUS_KICK_GAP_MS) {
-            focusKickAt = now
+        // the start: an active focus scan while nothing is seen and the picture is soft, spaced so continuous
+        // focus runs between scans (FocusKick)
+        if (focusKick.update(now, fresh, focusLock.locked, s.optDouble("sharpness", 0.0))) {
             camera?.cameraControl?.let { c ->
                 val centre = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f)
-                try { c.startFocusAndMetering(FocusMeteringAction.Builder(centre, FocusMeteringAction.FLAG_AF).setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS).build()) } catch (_: Throwable) {}
+                try { c.startFocusAndMetering(FocusMeteringAction.Builder(centre, FocusMeteringAction.FLAG_AF).setAutoCancelDuration(FocusKick.SCAN_MS, java.util.concurrent.TimeUnit.MILLISECONDS).build()) } catch (_: Throwable) {}
             }
         }
         // the phase: two sender frames blended in every capture (the panel mid-change when the camera looks) move
@@ -707,12 +764,12 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             // a read whole: 90% of its frame's codewords or more (the lock line needs them)
             val whole = s.optLong("codewords") > 0 && s.optLong("codewords_ok") * 10 >= s.optLong("codewords") * 9
             // a read that looks clean yet reads under a fifth of its codewords, with cells large enough and the
-            // border sharp, is a blend the measure under-reports (a MacBook panel settles slowly: 15-25% of the
+            // border sharp, is a blend the measure under-reports (a slow LCD panel settles: 15-25% of the
             // previous frame over the whole tile read 2 of 96 at mix 0.06-0.36, 2026-11-03): it counts as blended
-            val poor = dataRead && s.optLong("codewords") > 0 && s.optLong("codewords_ok") * 5 < s.optLong("codewords") &&
-                s.optDouble("cell_px", 0.0) >= Guidance.floor(pitch, format?.contains(" bw ") == true) && s.optDouble("edge_px", 0.0) < Guidance.EDGE_SOFT
+            val poor = dataRead && Guidance.blendSuspected(s.optLong("codewords_ok"), s.optLong("codewords"), s.optDouble("cell_px", 0.0),
+                s.optDouble("edge_px", 0.0), pitch, format?.contains(" bw ") == true)
             // as a full blend: the lock (held while the blend stays under UNLOCK_MIX) must drop for the step to come
-            // (phone on the MacBook, 06:45: reads fell 96 -> 2 of 96 with mix 0.0-0.15 and the lock held for 20 s)
+            // (phone on a laptop, 06:45: reads fell 96 -> 2 of 96 with mix 0.0-0.15 and the lock held for 20 s)
             val mixEff = if (poor) maxOf(dataMix, PhaseLock.UNLOCK_MIX + 0.2) else dataMix
             if (phase.update(dataRead, mixEff, ratesMatch, now, whole)) ctl.start(phase.shiftMs, resultExpNs > 0 && resultIso > 0, now)
             if (phase.stepTimedOut) ctl.abort()
@@ -722,10 +779,18 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val done = maxOf(s.optLong("bytes_done"), s.optLong("received_bytes")); val total = s.optLong("stream_size")
         val mbit = s.optDouble("mbit_per_s", 0.0)
         val failure = s.str("last_error").takeIf { failAt > 0 && now - failAt < Guidance.FRESH_MS }
-        val hint = hold.next(Guidance.hint(Reading(fresh, failure,
+        val readsWell = fresh && s.optLong("codewords") > 0 && s.optLong("codewords_ok") >= s.optLong("codewords") * Guidance.READS_WELL
+        val close = tooClose.update(now, afState, focusDiopters, minFocusDiopters, readsWell)
+        val reading = Reading(fresh, failure,
             dataPitch, dataBw, dataCell, dataEdges, s.optLong("codewords_ok"), s.optLong("codewords"), total > 0,
             mix = dataMix, edgePx = dataEdgePx, locked = locked,
-            phaseFixing = phaseCtl != null && phase.state != PhaseLock.State.OFF && !phase.resting(now) && phaseRatesMatch)), now)
+            phaseFixing = phaseCtl != null && phase.state != PhaseLock.State.OFF && !phase.resting(now) && phaseRatesMatch,
+            tooClose = close)
+        val hint = hold.next(Guidance.hint(reading), now)
+        // nearer than this lens focuses (big soft cells): the lens that focuses nearest, when the phone has one
+        boundLens?.let { b ->
+            if (newRead && !cameraProblem && lensChoice.observe(fresh && !readsWell && Guidance.softAndBig(reading), now, b, lenses) != null) bindCamera()
+        }
         val otherVersion = versions.update(failure, fresh, now)
 
         // Auto: the stream follows how the data reads (a rebind keeps the session and its progress)
@@ -787,7 +852,8 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val sf = s.optDouble("sender_fps", 0.0)
         val tierName = if (boundTier == Tier.MAX) "Max" else "Full HD"
         return buildList {
-            add("Camera" to "${camSize.ifEmpty { "–" }} · %.1f fps · ${mode.label}".format(camFps) + if (mode == CameraMode.AUTO) " ($tierName)" else "")
+            add("Camera" to "${camSize.ifEmpty { "–" }} · %.1f fps · ${mode.label}".format(camFps) + (if (mode == CameraMode.AUTO) " ($tierName)" else "") +
+                (boundLens?.let { " · lens ${it.id}" + if (it.nearestDiopters > 0) " (nearest %.2f m)".format(1 / it.nearestDiopters) else "" } ?: ""))
             add("Sender" to if (sf > 0) "%.1f fps".format(sf) else "not measured yet")
             add("Decode" to "%.0f ms (b/w %.0f, colour %.0f)".format(s.optDouble("decode_ms", 0.0), s.optDouble("luma_ms", 0.0), s.optDouble("colour_ms", 0.0)))
             add("Captures" to "%,d".format(received))
@@ -805,7 +871,8 @@ class MainActivity : AppCompatActivity(), ScreenHost {
                 else -> "searching"
             } + " · ${phase.steps} steps" + (if (phase.lastMoveMs != 0.0) " · last %.1f ms (%s)".format(java.util.Locale.ROOT, phase.lastMoveMs, if (phaseCtl?.lastExact == true) "exact" else "rate") else "") +
                 (if (phase.settleMix >= 0) " · blend %.2f".format(java.util.Locale.ROOT, phase.settleMix) else "") + if (phase.ignored > 0) " · ignored ${phase.ignored}x" else "")
-            add("Focus" to (if (focusLock.locked) "locked" else "continuous") + " · " + afName(afState) + if (focusDiopters > 0) " · %.2f m".format(1 / focusDiopters) else "")
+            add("Focus" to (if (focusLock.locked) "locked" else "continuous") + " · " + afName(afState) + (if (focusDiopters > 0) " · %.2f m".format(1 / focusDiopters) else "") +
+                (if (minFocusDiopters > 0) " (nearest %.2f m)".format(1 / minFocusDiopters) else "") + if (tooClose.on) " · too close" else "")
             if (s.optDouble("edge_px", 0.0) > 0) add("Sharpness" to "edges %.2f camera px · frames blended over %.0f%%".format(s.optDouble("edge_px", 0.0), s.optDouble("mix", 0.0) * 100))
             s.str("last_error")?.let { add("Last error" to it) }
         }
@@ -879,6 +946,22 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED, CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> "AF focused"
         CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED, CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> "AF not focused"
         else -> "AF –"
+    }
+
+    /** Lab: every camera the app can open (and the bound one's physical lenses), with its nearest focus and
+     *  focal lengths, to the log. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun logCameras(provider: ProcessCameraProvider, bound: androidx.camera.core.Camera) {
+        fun line(i: androidx.camera.core.CameraInfo): String = try {
+            val c = Camera2CameraInfo.from(i)
+            val f = c.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString("/") ?: "?"
+            val d = c.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+            val facing = c.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+            "id ${c.cameraId} facing $facing focal $f mm nearest ${if (d > 0) "%.3f m".format(1 / d) else "fixed"} zoom ${i.zoomState.value?.minZoomRatio}-${i.zoomState.value?.maxZoomRatio}"
+        } catch (t: Throwable) { "? ${t.message}" }
+        val all = provider.availableCameraInfos.joinToString(" | ") { line(it) }
+        val phys = try { bound.cameraInfo.physicalCameraInfos.joinToString(" | ") { line(it) } } catch (t: Throwable) { "? ${t.message}" }
+        android.util.Log.i("LensBolt", "cameras: $all || bound physical: $phys")
     }
 
     private fun dump(img: ImageProxy) {
@@ -1603,7 +1686,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         if (i.getBooleanExtra("lab_details", false)) {
             detailsOn = true; screen.setDetailsOn(true)   // this run only: the remembered choice is unchanged
             lastRows = listOf(
-                "Camera" to "1440x1080 · 29.8 fps · Auto (Full HD)", "Sender" to "60.0 fps", "Decode" to "65 ms (b/w 62, colour 141)",
+                "Camera" to "1920x1080 · 29.8 fps · Auto (Full HD)", "Sender" to "60.0 fps", "Decode" to "65 ms (b/w 62, colour 141)",
                 "Captures" to "3,195", "Decoded" to "2,557 · 44 failed", "Dropped" to "592 (18.5%)", "Colour skipped" to "3",
                 "Codewords" to "83 / 83", "Format" to "2px bw 1024x1024", "Cell size" to "1.92 camera px · perspective 1.04", "Exposure" to "EV -2")
             screen.setDetails(lastRows)
@@ -1672,7 +1755,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             var x = -0x61c8864680b583ebL
             f.writeBytes(ByteArray(3 shl 20) { x = x xor (x shl 13); x = x xor (x ushr 7); x = x xor (x shl 17); x.toByte() })
         }
-        // the lab's figure is a measured one (3 MB in 5.5 s = 4.6 Mbit/s, the MSI runs of 2026-11-03), never a made-up rate
+        // the lab's figure is a measured one (3 MB in 5.5 s = 4.6 Mbit/s, the laptop runs of 2026-11-03), never a made-up rate
         enterDone(f, 5.5, f.length())
         if (copy) copyTo(f, Storage.contentUri(this, File(dir, "lab-copy.bin")))
     }

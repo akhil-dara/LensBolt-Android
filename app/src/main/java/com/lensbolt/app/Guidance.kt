@@ -29,6 +29,48 @@ object Hints {
     val READING_UNLOCKED = Hint("Reading…", Tone.WARN)
     val READING_UNLOCKED_FOCUS = Hint("Reading… focusing", Tone.WARN)
     val STEADY_FOCUS = Hint("Hold steady: focusing", Tone.WARN)
+    // the camera cannot focus this near ([TooCloseWatch]): never "Move closer", whatever the cells measure
+    val TOO_CLOSE = Hint("Too close to focus: move back a little", Tone.WARN)
+}
+
+/** Whether the phone is nearer than its camera can focus: the lens at its nearest setting (within [NEAR] of the
+ *  camera's minimum focus distance, in diopters) and the autofocus reporting not focused, for [ON_MS]; off once
+ *  that has not held for [OFF_MS]. Measured 2026-11-03: a phone's main camera (the default back camera, a
+ *  logical one over the ultrawide and main) focuses no nearer than 13 cm (7.69 D), so a phone sender held at
+ *  8 cm never sharpened, the tap ring went amber, and the guidance said "Move closer" (the cells read small).
+ *  A sharp picture at the nearest setting, or a camera that reports no minimum (fixed focus), never counts; one
+ *  whole read while the lens reports its nearest end silences it until [reset] (that camera's report is wrong). */
+class TooCloseWatch {
+    companion object {
+        const val NEAR = 0.92f; const val ON_MS = 800L; const val OFF_MS = 1500L
+        // CaptureResult.CONTROL_AF_STATE values (kept here so the rule is tested on the JVM)
+        const val AF_PASSIVE_FOCUSED = 2; const val AF_FOCUSED_LOCKED = 4; const val AF_NOT_FOCUSED_LOCKED = 5; const val AF_PASSIVE_UNFOCUSED = 6
+    }
+    private var since = -1L
+    private var clearSince = -1L
+    var on = false
+        private set
+    // a whole read while the lens reported its nearest end: this camera's report cannot be trusted (until reset)
+    private var distrusted = false
+    /** One status poll; `readsWell`: the tile read whole on this poll. */
+    fun update(now: Long, afState: Int, focusDiopters: Float, minDiopters: Float, readsWell: Boolean = false): Boolean {
+        val near = minDiopters > 0f && focusDiopters >= minDiopters * NEAR
+        // a phone camera reports its lens at the nearest end, not focused, while the tile reads 49 of 49 (2026-11-03)
+        if (near && readsWell) distrusted = true
+        if (distrusted) { since = -1L; clearSince = -1L; on = false; return false }
+        // not focused: any known state but focused; a scan there counts (it keeps coming back to no focus)
+        val unfocused = afState >= 0 && afState != AF_PASSIVE_FOCUSED && afState != AF_FOCUSED_LOCKED
+        if (near && unfocused) {
+            clearSince = -1L
+            if (since < 0) since = now
+            if (now - since >= ON_MS) on = true
+        } else {
+            since = -1L
+            if (on) { if (clearSince < 0) clearSince = now; if (now - clearSince >= OFF_MS) { on = false; clearSince = -1L } }
+        }
+        return on
+    }
+    fun reset() { since = -1L; clearSince = -1L; on = false; distrusted = false }
 }
 
 /** What the decoder said lately (one UI poll). */
@@ -51,6 +93,8 @@ data class Reading(
     /** the app is moving the camera's timing itself (PhaseLock searching, stepping or measuring, the rates
      *  matching): a blend is its job, not the user's */
     val phaseFixing: Boolean = false,
+    /** the phone is nearer than the camera can focus ([TooCloseWatch]) */
+    val tooClose: Boolean = false,
 )
 
 /** "Locked on" (the blue line): the tile read without a gap (every poll fresh) for [trackMs], and at least one
@@ -112,7 +156,7 @@ object Guidance {
      *  count reaches the stream size while the fountain may still need frames. */
     fun finishing(bytesDone: Long, streamSize: Long): Boolean = streamSize > 0 && bytesDone >= streamSize
     // codewords this share or better: the tile reads, so the user is never told to move
-    private const val READS_WELL = 0.9
+    const val READS_WELL = 0.9
     // edge-to-edge sampling spread that costs reads, and one that is worth fixing even while reading
     private const val SKEW_HURTS = 1.15
     private const val SKEW_STRONG = 1.3
@@ -138,12 +182,32 @@ object Guidance {
         return if (lo > 0) hi / lo else 1.0
     }
 
+    /** Edges wider than this many cells, on cells of at least [SOFT_BIG] times the format's floor, are the
+     *  picture of a phone nearer than its lens focuses: measured on a phone at 4096x3072 reading a
+     *  phone sender's 2 px tile (2026-11-04), 4.1 px cells with 5.8-7.9 px edges read 0-102 of 111 at 8 cm, and 2.8 px
+     *  cells with 3.5 px edges read 111 of 111 at 15 cm. Seen in the picture, so it holds on every phone (the
+     *  lens's own report is wrong on some: [TooCloseWatch]). */
+    const val SOFT_RATIO = 1.4
+    const val SOFT_BIG = 2.0
+    /** A data read losing codewords that only a blend of two sender frames explains: under half of its frame's
+     *  codewords while the border is sharp and the cells are at least the format's floor (soft edges or small cells
+     *  are focus or distance, not timing). The phase step then treats it as a full blend: a blend the measure
+     *  under-reports (a slow LCD panel) read 31-36 of 111 for 5 s at a measured blend of 0.0-0.1, and the step
+     *  waited until reads fell under a fifth; one step brought 111 back (a session log, 2026-11-04). */
+    fun blendSuspected(ok: Long, all: Long, cellPx: Double, edgePx: Double, pitch: Int, bw: Boolean): Boolean =
+        all > 0 && ok * 2 < all && cellPx >= floor(pitch, bw) && edgePx < EDGE_SOFT
+
+    fun softAndBig(r: Reading): Boolean =
+        r.edgePx > 0 && r.cellPx >= floor(r.pitch, r.bw) * SOFT_BIG && r.edgePx > SOFT_RATIO * r.cellPx
+
     fun hint(r: Reading): Hint {
         if (r.fresh) {
             val reads = r.codewords <= 0 || r.codewordsOk >= r.codewords * READS_WELL
             val sk = skew(r.edges)
             if (sk > SKEW_STRONG) return Hints.SQUARE
             if (!reads) {
+                // nearer than the camera focuses: moving closer would only make it worse
+                if (r.tooClose || softAndBig(r)) return Hints.TOO_CLOSE
                 // the tile is found but loses codewords: too small for its format, at an angle, or moving
                 if (r.cellPx > 0 && r.cellPx < floor(r.pitch, r.bw) * 1.1) return Hints.CLOSER
                 if (sk > SKEW_HURTS) return Hints.SQUARE
@@ -157,8 +221,9 @@ object Guidance {
             return Hints.GOOD
         }
         val f = r.failure
-        // the markers were found but the frame did not read: blur, or the header lost in motion
-        if (f != null && (f.startsWith("TooBlurry") || f.startsWith("NoHeader"))) return Hints.STEADY
+        // the markers were found but the frame did not read: blur, or the header lost in motion (blur from being
+        // nearer than the camera focuses: say so)
+        if (f != null && (f.startsWith("TooBlurry") || f.startsWith("NoHeader"))) return if (r.tooClose) Hints.TOO_CLOSE else Hints.STEADY
         return if (r.receiving) Hints.LOST else Hints.SEARCH
     }
 }

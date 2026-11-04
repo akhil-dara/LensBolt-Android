@@ -11,7 +11,7 @@ name = "lensbolt"
 crate-type = ["cdylib"]
 
 [dependencies]
-lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.3", default-features = false, features = ["zstd"] }
+lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.4", default-features = false, features = ["zstd"] }
 jni = "0.21"
 
 [profile.release]

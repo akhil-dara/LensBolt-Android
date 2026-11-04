@@ -28,7 +28,9 @@ import android.graphics.drawable.RippleDrawable
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.animation.DecelerateInterpolator
@@ -74,7 +76,15 @@ sealed class UiState {
 enum class Action { SOURCE, GRANT, SETTINGS, SAVE, OPEN, SHARE, NEW_TRANSFER, RETRY_CAMERA, START_OVER, DONATE_COFFEE, DONATE_SPONSORS, DONATE_LATER, DONATE_NEVER }
 
 enum class CameraMode(val label: String, val menu: String) {
-    AUTO("Auto", "Auto (recommended)"), FULL_HD("Full HD", "Full HD"), MAX("Max", "Max resolution")
+    AUTO("Auto", "Auto (recommended)"), FULL_HD("Full HD", "Full HD"), MAX("Max", "Max resolution");
+    companion object {
+        /** What the camera menu offers. Max is not: a laptop's tile at 4096x3072 ran a phone's camera at 3-4 fps
+         *  with decodes of 0.5-1.2 s, against 30 fps and 35-44 ms at Full HD (2026-11-04). Auto still takes the
+         *  large stream for a 1 px tile ([CameraChoice]). */
+        val MENU = listOf(AUTO, FULL_HD)
+        /** A saved choice: one the menu no longer offers (Max), or none, is Auto. */
+        fun fromSaved(s: String?): CameraMode = entries.firstOrNull { it.name == s }?.takeIf { it in MENU } ?: AUTO
+    }
 }
 
 interface ScreenHost : PaneHost {
@@ -83,6 +93,9 @@ interface ScreenHost : PaneHost {
     fun onDetails(on: Boolean)
     /** the top bar's History; the receiving panel's Files */
     fun onShowPane(p: Pane)
+    /** A tap on the preview at (x, y) in the preview's own coordinates: focus there; `done` with whether the
+     *  camera reports it focused (false when it refused or has no camera). */
+    fun onTapFocus(x: Float, y: Float, done: (Boolean) -> Unit) { done(false) }
 }
 
 /** Sizes and times as the screen writes them. */
@@ -181,6 +194,32 @@ class Glyph(private val kind: Kind, var color: Int, density: Float, sizeDp: Int 
 }
 
 /** Corner marks around the square the tile should fill, on the camera image as FIT_CENTER shows it. */
+/** Where a tap asked the camera to focus: a ring that settles there, blue when the camera reports it focused,
+ *  amber when it does not, then fades. It never takes a touch. */
+private class FocusRing(ctx: Context, private val px: (Int) -> Int) : View(ctx) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = px(2).toFloat(); color = Color.WHITE }
+    private val shade = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = px(4).toFloat(); color = 0x59000000 }
+    private val fade = Runnable { animate().alpha(0f).setDuration(180).start() }
+    init { alpha = 0f; isClickable = false; importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+    override fun onDraw(canvas: Canvas) {
+        val r = width / 2f - px(3)
+        canvas.drawCircle(width / 2f, height / 2f, r, shade)
+        canvas.drawCircle(width / 2f, height / 2f, r, paint)
+    }
+    /** settle at (cx, cy), the centre in the parent's coordinates */
+    fun show(cx: Float, cy: Float) {
+        removeCallbacks(fade); animate().cancel()
+        paint.color = Color.WHITE; invalidate()
+        x = cx - width / 2f; y = cy - height / 2f
+        scaleX = 1.35f; scaleY = 1.35f; alpha = 0f
+        animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(220).start()
+    }
+    fun result(ok: Boolean) {
+        paint.color = if (ok) Ink.PRIMARY_TEXT else Ink.AMBER_TEXT; invalidate()
+        removeCallbacks(fade); postDelayed(fade, 900)
+    }
+}
+
 private class GuideView(ctx: Context) : View(ctx) {
     /** the camera image's long side over its short side (4:3 streams) */
     var aspect = 4f / 3f
@@ -344,6 +383,26 @@ private class Stage(ctx: Context) : ViewGroup(ctx) {
 }
 
 class ReceiverScreen(private val activity: Activity, private val preview: PreviewView, private val host: ScreenHost) {
+    private lateinit var focusRing: View
+    /** A short tap (no drag) on the preview: the ring there, the camera focused there. */
+    private val tapToFocus = object : View.OnTouchListener {
+        private var downX = 0f; private var downY = 0f; private var downAt = 0L
+        override fun onTouch(v: View, e: MotionEvent): Boolean {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y; downAt = e.eventTime }
+                MotionEvent.ACTION_UP -> {
+                    val slop = ViewConfiguration.get(v.context).scaledTouchSlop
+                    if (Math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) <= slop && e.eventTime - downAt < 500) {
+                        v.performClick()
+                        val ring = focusRing as FocusRing
+                        ring.show(v.x + e.x, v.y + e.y)
+                        host.onTapFocus(e.x, e.y) { ok -> ring.result(ok) }
+                    }
+                }
+            }
+            return true
+        }
+    }
     /** The content view; its children are rebuilt on every configuration change (rotation, font size). */
     val root = FrameLayout(activity).apply { setBackgroundColor(Color.BLACK) }
 
@@ -673,6 +732,10 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         if (preview.parent == null) {
             preview.contentDescription = "Camera view"
             root.addView(preview, FrameLayout.LayoutParams(-1, -1))
+            // a tap on the picture focuses there (the ring above the preview, under every layer)
+            focusRing = FocusRing(ctx) { dp(it) }
+            root.addView(focusRing, FrameLayout.LayoutParams(dp(76), dp(76)))
+            preview.setOnTouchListener(tapToFocus)
         }
         if (::stage.isInitialized) root.removeView(stage)
         stage = Stage(ctx).apply {
@@ -768,9 +831,9 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
 
     private fun showModeMenu() {
         val menu = PopupMenu(ctx, modeBtn)
-        for ((i, m) in CameraMode.entries.withIndex()) menu.menu.add(1, i, i, m.menu).isChecked = m == mode
+        for ((i, m) in CameraMode.MENU.withIndex()) menu.menu.add(1, i, i, m.menu).isChecked = m == mode
         menu.menu.setGroupCheckable(1, true, true)
-        menu.setOnMenuItemClickListener { item -> host.onCameraMode(CameraMode.entries[item.itemId]); true }
+        menu.setOnMenuItemClickListener { item -> host.onCameraMode(CameraMode.MENU[item.itemId]); true }
         menu.show()
     }
 
@@ -799,9 +862,13 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         detailsBox = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(12))
-            background = rounded(Ink.SURFACE, 16)
         }
-        detailsScroll = ScrollView(ctx).apply { addView(detailsBox); isVerticalScrollBarEnabled = true; visibility = View.GONE }
+        // the card is the scroll view itself, clipped to its rounded outline: when the band under the guide is short,
+        // the rows scroll inside a whole card (on the inner box, the card's bottom edge scrolled out of sight)
+        detailsScroll = ScrollView(ctx).apply {
+            addView(detailsBox); isVerticalScrollBarEnabled = true; visibility = View.GONE
+            background = rounded(Ink.SURFACE, 16); clipToOutline = true
+        }
     }
 
     private fun cameraState() = state.let { it == null || it is UiState.Aim || it is UiState.Locked || it is UiState.Receiving }
