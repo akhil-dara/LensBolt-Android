@@ -90,6 +90,8 @@ enum class CameraMode(val label: String, val menu: String) {
 interface ScreenHost : PaneHost {
     fun onAction(a: Action)
     fun onCameraMode(m: CameraMode)
+    /** the camera menu's How it works, Rate LensBolt and Send feedback */
+    fun onHelp(item: Help.Item) {}
     fun onDetails(on: Boolean)
     /** the top bar's History; the receiving panel's Files */
     fun onShowPane(p: Pane)
@@ -833,7 +835,13 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         val menu = PopupMenu(ctx, modeBtn)
         for ((i, m) in CameraMode.MENU.withIndex()) menu.menu.add(1, i, i, m.menu).isChecked = m == mode
         menu.menu.setGroupCheckable(1, true, true)
-        menu.setOnMenuItemClickListener { item -> host.onCameraMode(CameraMode.MENU[item.itemId]); true }
+        // after the camera modes: the guide again, rating the app, feedback
+        val extra = 100
+        for ((i, h) in Help.Item.entries.withIndex()) menu.menu.add(2, extra + i, extra + i, h.label)
+        menu.setOnMenuItemClickListener { item ->
+            if (item.itemId >= extra) host.onHelp(Help.Item.entries[item.itemId - extra]) else host.onCameraMode(CameraMode.MENU[item.itemId])
+            true
+        }
         menu.show()
     }
 

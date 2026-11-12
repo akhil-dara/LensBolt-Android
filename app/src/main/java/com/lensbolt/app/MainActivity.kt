@@ -295,6 +295,32 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             !granted() -> show(permissionState())
             else -> startCamera()
         }
+        // the first real start: how a transfer goes, once (the camera menu has it again)
+        if (savedInstanceState == null && Help.showGuide(prefs.getBoolean("guideSeen", false), labReq != null)) showGuide()
+    }
+
+    private fun showGuide() {
+        val steps = Help.STEPS.withIndex().joinToString("\n\n") { (i, t) -> "${i + 1}. $t" }
+        AlertDialog.Builder(this)
+            .setTitle(Help.TITLE)
+            .setMessage("$steps\n\n${Help.FOOT}")
+            .setPositiveButton(Help.OK, null)
+            .setOnDismissListener { prefs.edit().putBoolean("guideSeen", true).apply() }
+            .show()
+    }
+
+    override fun onHelp(item: Help.Item) {
+        when (item) {
+            Help.Item.GUIDE -> showGuide()
+            Help.Item.RATE -> openLink(Help.rateUri(packageName), Help.rateWebUri(packageName))
+            Help.Item.FEEDBACK -> openLink(Help.FEEDBACK_URI)
+        }
+    }
+
+    // the Play app for a market link, else the browser; nothing when neither is there
+    private fun openLink(uri: String, fallback: String? = null) {
+        try { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(uri))) }
+        catch (_: Throwable) { if (fallback != null) try { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(fallback))) } catch (_: Throwable) {} }
     }
 
     // the status is polled only while the activity is visible

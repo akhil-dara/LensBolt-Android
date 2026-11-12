@@ -23,8 +23,8 @@ android {
         minSdk = 29
         // Play: new apps and updates target API 36 (Android 16) from 31 August 2026
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
     signingConfigs {
