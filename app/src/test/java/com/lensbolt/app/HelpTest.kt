@@ -32,4 +32,12 @@ class HelpTest {
     @Test fun theMenuOffersHelpRatingAndFeedback() {
         assertEquals(listOf("How it works", "Rate LensBolt", "Send feedback"), Help.Item.entries.map { it.label })
     }
+
+    // Details as text for a report: the app and the phone first, then the rows that have a value
+    @Test fun theDetailsReportListsTheRowsWithAValue() {
+        val rows = listOf("Camera" to "1920x1080 · 30.0 fps", "Sender" to "–", "Lens" to "", "Cell size" to "2.4 px")
+        val want = listOf("LensBolt 1.3.0 · Android 14 · Test Phone", "Camera: 1920x1080 · 30.0 fps", "Cell size: 2.4 px").joinToString(System.lineSeparator())
+        assertEquals(want, Help.report(rows, "1.3.0", "Android 14 · Test Phone"))
+        assertEquals("LensBolt 1.3.0 · Android 14 · Test Phone", Help.report(emptyList(), "1.3.0", "Android 14 · Test Phone"))
+    }
 }

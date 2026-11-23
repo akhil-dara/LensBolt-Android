@@ -71,9 +71,11 @@ sealed class UiState {
     data class Problem(val title: String, val text: String, val action: Action, val actionLabel: String) : UiState()
     /** A batch is in: its Done screen is the file list (FilesPane, header from [ReceiverScreen.setFiles]). */
     data class BatchDone(val name: String) : UiState()
+    /** The camera is off and the session waits ([Pause]). */
+    data class Paused(val done: Long, val total: Long) : UiState()
 }
 
-enum class Action { SOURCE, GRANT, SETTINGS, SAVE, OPEN, SHARE, NEW_TRANSFER, RETRY_CAMERA, START_OVER, DONATE_COFFEE, DONATE_SPONSORS, DONATE_LATER, DONATE_NEVER }
+enum class Action { SOURCE, GRANT, SETTINGS, SAVE, OPEN, SHARE, NEW_TRANSFER, RETRY_CAMERA, START_OVER, PAUSE, RESUME, DONATE_COFFEE, DONATE_SPONSORS, DONATE_LATER, DONATE_NEVER }
 
 enum class CameraMode(val label: String, val menu: String) {
     AUTO("Auto", "Auto (recommended)"), FULL_HD("Full HD", "Full HD"), MAX("Max", "Max resolution");
@@ -149,7 +151,7 @@ internal enum class Type(val sp: Float, val line: Float, val medium: Boolean) {
 
 /** Icons drawn on a 24-unit grid in one 2-unit stroke. */
 class Glyph(private val kind: Kind, var color: Int, density: Float, sizeDp: Int = 24) : Drawable() {
-    enum class Kind { CAMERA, DETAILS, VERIFIED, WARN, DOT, HISTORY }
+    enum class Kind { CAMERA, DETAILS, VERIFIED, WARN, DOT, HISTORY, PAUSE }
     private val px = (sizeDp * density).roundToInt()
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2f; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -185,6 +187,11 @@ class Glyph(private val kind: Kind, var color: Int, density: Float, sizeDp: Int 
             Kind.HISTORY -> {
                 c.drawCircle(12f, 12f, 9f, stroke)
                 c.drawPath(Path().apply { moveTo(12f, 7.5f); lineTo(12f, 12f); lineTo(15f, 14f) }, stroke)
+            }
+            Kind.PAUSE -> {
+                c.drawCircle(12f, 12f, 9f, stroke)
+                c.drawLine(9.75f, 8.75f, 9.75f, 15.25f, stroke)
+                c.drawLine(14.25f, 8.75f, 14.25f, 15.25f, stroke)
             }
         }
         c.restore()
@@ -495,6 +502,7 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
     // the guidance line and Start over share a row (the band under the guide is short)
     private lateinit var hintRow: LinearLayout
     private lateinit var bStart: Button
+    private lateinit var bPause: Button
     private lateinit var donateBox: LinearLayout
     private var primaryAction = Action.SAVE
     private var textAction = Action.NEW_TRANSFER
@@ -608,7 +616,7 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         if (s !is UiState.Problem) announcedProblem = null
         state = s
         shownKind = s.javaClass
-        val full = s is UiState.Permission || s is UiState.Done || s is UiState.Problem || s is UiState.BatchDone
+        val full = s is UiState.Permission || s is UiState.Done || s is UiState.Problem || s is UiState.BatchDone || s is UiState.Paused
         // the file list (a batch's Done screen, or opened over a transfer) and the history cover the camera
         val paneNow = when { pane == Pane.HISTORY -> Pane.HISTORY; s is UiState.BatchDone || pane == Pane.FILES -> Pane.FILES; else -> Pane.NONE }
         if (filesPane.showing != paneNow) filesPane.show(paneNow)
@@ -666,7 +674,7 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
                 // and the parts they name, small, under them (what the sender will send)
                 s.finishParts?.let { setText(tParts, it) }
                 vis(tParts, s.finishParts != null)
-                show += bStart
+                show += if (Pause.offered(finishing)) bPause else bStart
                 announcedLock = true
                 // one live-region update per render: two set in a row may be merged and the first never spoken
                 val say = ArrayList<String>()
@@ -702,6 +710,19 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
             is UiState.BatchDone -> {
                 if (announcedDone != s.name) { announcedDone = s.name; announce("Received ${s.name}. Every file SHA-256 verified.") }
             }
+            is UiState.Paused -> {
+                showMark(Glyph.Kind.PAUSE, Ink.PRIMARY_TEXT, 40); show += mark
+                title(Pause.TITLE)
+                body(Pause.BODY); show += tBody
+                val permille = if (s.total > 0) (s.done * 1000 / s.total).toInt().coerceIn(0, 990) else 0
+                if (progress.progress != permille) progress.setProgress(permille, false)
+                ViewCompat.setStateDescription(progress, "${permille / 10} percent")
+                show += progress; show += tMeta1
+                setText(tMeta1, "${Fmt.bytes(minOf(s.done, s.total))} of ${Fmt.bytes(s.total)} · ${permille / 10}%")
+                primary(Pause.RESUME, Action.RESUME); show += bPrimary
+                text("Start over", Action.START_OVER); show += bText
+                if (kindChanged) announce(Pause.spoken(permille))
+            }
             is UiState.Problem -> {
                 showMark(Glyph.Kind.WARN, Ink.AMBER_TEXT, 32); show += mark
                 title(s.title)
@@ -713,7 +734,7 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         }
         if (s !is UiState.Receiving) vis(bFiles, false)
         if (tMeta1 in show) show += metaRow
-        for (v in listOf(mark, tBody, progress, metaRow, tMeta1, tMeta2, finishBox, tVerified, shaRow, tSaved, hintRow, tHint, bStart, tNote, bPrimary, rowAB, bText, donateBox)) vis(v, v in show)
+        for (v in listOf(mark, tBody, progress, metaRow, tMeta1, tMeta2, finishBox, tVerified, shaRow, tSaved, hintRow, tHint, bStart, bPause, tNote, bPrimary, rowAB, bText, donateBox)) vis(v, v in show)
         applyBanner()
         applyChanging(s)
         if (detailsOn) fillDetails()   // a camera state shows the short list, the others the full one
@@ -721,7 +742,7 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
     }
 
     private fun applyPreviewA11y(s: UiState) {
-        val full = s is UiState.Permission || s is UiState.Done || s is UiState.Problem || s is UiState.BatchDone || pane != Pane.NONE
+        val full = s is UiState.Permission || s is UiState.Done || s is UiState.Problem || s is UiState.BatchDone || s is UiState.Paused || pane != Pane.NONE
         val want = if (previewLive && !full) View.IMPORTANT_FOR_ACCESSIBILITY_YES else View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         if (preview.importantForAccessibility != want) preview.importantForAccessibility = want
     }
@@ -911,11 +932,21 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
                 detailsBox.addView(row, LinearLayout.LayoutParams(-1, -2))
                 l to v
             }
+            // every row as text, to paste into a report
+            detailsBox.addView(button(2) { copyDetails() }.apply { text = "Copy details" }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
             // the app is open source: its repository, under the details (every build)
             detailsBox.addView(button(2) { host.onAction(Action.SOURCE) }.apply { text = "Source code on GitHub"; contentDescription = "Source code on GitHub (opens the browser)" },
-                LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
+                LinearLayout.LayoutParams(-2, -2))
         }
         for ((i, row) in rows.withIndex()) setText(detailViews[i].second, row.second)
+    }
+
+    private fun copyDetails() {
+        val app = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "" } catch (_: Throwable) { "" }
+        val device = "Android ${android.os.Build.VERSION.RELEASE} · ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
+        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("LensBolt details", Help.report(detailRows, app, device)))
+        announce("Details copied")
     }
 
     internal fun button(style: Int, onClick: () -> Unit) = Button(ctx).apply {
@@ -975,9 +1006,11 @@ class ReceiverScreen(private val activity: Activity, private val preview: Previe
         rowAB.addView(bShare, LinearLayout.LayoutParams(0, -2, 1f))
         bText = button(2) { host.onAction(textAction) }
         bStart = button(2) { host.onAction(Action.START_OVER) }.apply { text = "Start over" }
+        bPause = button(2) { host.onAction(Action.PAUSE) }.apply { text = Pause.PAUSE; contentDescription = "Pause the transfer" }
         hintRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         hintRow.addView(tHint, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
         hintRow.addView(bStart, LinearLayout.LayoutParams(-2, -2))
+        hintRow.addView(bPause, LinearLayout.LayoutParams(-2, -2))
         buildDonate()
 
         fun lp(top: Int = 0) = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) }

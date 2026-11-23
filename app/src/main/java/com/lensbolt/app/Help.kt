@@ -20,6 +20,11 @@ object Help {
     fun rateWebUri(pkg: String) = "https://play.google.com/store/apps/details?id=$pkg"
     const val FEEDBACK_URI = "https://github.com/akhil-dara/lensbolt-android/issues"
 
+    /** Details as text to paste into a report: the app and the phone, then each row that has a value. */
+    fun report(rows: List<Pair<String, String>>, app: String, device: String): String =
+        (listOf("LensBolt $app · $device") + rows.filter { it.second.isNotBlank() && it.second != "–" }.map { "${it.first}: ${it.second}" })
+            .joinToString(System.lineSeparator())
+
     /** The camera menu's items after the camera modes, in order. */
     enum class Item(val label: String) { GUIDE("How it works"), RATE("Rate LensBolt"), FEEDBACK("Send feedback") }
 }

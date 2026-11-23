@@ -58,7 +58,8 @@ data class Confirm(val title: String, val message: String, val risky: String, va
 
 /** The app's questions in one place (wording and which choice is the safe one). */
 object Asks {
-    fun startOver() = Confirm("Start over?", "What has been received so far is discarded.", risky = "Start over", safe = "Keep receiving")
+    fun startOver(paused: Boolean = false) = Confirm("Start over?", "What has been received so far is discarded.", risky = "Start over", safe = if (paused) "Stay paused" else "Keep receiving")
+    fun leavePaused() = Confirm("Leave LensBolt?", "What has been received so far is discarded.", risky = "Leave", safe = "Stay paused")
     fun clearHistory() = Confirm("Clear history?", "The list of saved files is removed. The files stay where they were saved.", risky = "Clear", safe = "Keep")
     fun notSaved(name: String) = Confirm("Not saved yet",
         "$name is only inside LensBolt. Save it to keep it; otherwise it is removed the next time LensBolt starts.", risky = "Discard", safe = "Save")

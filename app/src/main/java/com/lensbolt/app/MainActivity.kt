@@ -106,6 +106,8 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     }
     // the window's keep-screen-on flag, changed on transitions only
     private val screenOn = Changes<Boolean>()
+    private val pauseClock = PauseClock()
+    private var pausedFrom: UiState.Receiving? = null
 
     // camera mode: Auto is Full HD except for 1 px tiles (CameraChoice); the menu forces one
     private var mode = CameraMode.AUTO
@@ -242,7 +244,13 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     }
 
     private val backCallback = object : OnBackPressedCallback(false) {
-        override fun handleOnBackPressed() { if (pane != Pane.NONE) setPane(Pane.NONE) else askBeforeLeaving() }
+        override fun handleOnBackPressed() {
+            when {
+                pane != Pane.NONE -> setPane(Pane.NONE)
+                pauseClock.paused -> confirm(Asks.leavePaused(), onRisky = { finish() })
+                else -> askBeforeLeaving()
+            }
+        }
     }
 
     // a 180-degree turn changes no configuration: the preview's rotation follows the display
@@ -424,7 +432,20 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             Action.SOURCE -> openLink(DonatePrompt.SOURCE)
             Action.DONATE_LATER -> { donate = false; renderDone() }
             Action.DONATE_NEVER -> { prefs.edit().putBoolean("donateNever", true).apply(); donate = false; renderDone() }
-            Action.START_OVER -> confirm(Asks.startOver(), onRisky = { onAction(Action.NEW_TRANSFER) })
+            Action.START_OVER -> confirm(Asks.startOver(pauseClock.paused), onRisky = { onAction(Action.NEW_TRANSFER) })
+            Action.PAUSE -> (state as? UiState.Receiving)?.let { r ->
+                pauseClock.pause(SystemClock.uptimeMillis())
+                pausedFrom = r
+                bindCamera()
+                show(UiState.Paused(r.done, r.total))
+            }
+            Action.RESUME -> if (pauseClock.paused) {
+                pauseClock.resume(SystemClock.uptimeMillis())
+                hold.reset(); readAt = 0
+                show(pausedFrom?.let { Pause.resumed(it) } ?: UiState.Aim(Hints.SEARCH))
+                pausedFrom = null
+                bindCamera()
+            }
         }
     }
 
@@ -474,7 +495,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     private fun newSession() {
         sessions.start()
         doneFile = null; savedAs = null; savedOrShared = false; backAsked = false; doneNote = null; savePct = -1; donate = false
-        stopped = null; spaceChecked = false; sessionLog = null
+        stopped = null; spaceChecked = false; sessionLog = null; pauseClock.reset(); pausedFrom = null
         lastDecoded = 0; lastDataReads = 0; lastFailed = 0; lastSkipped = 0; readAt = 0; failAt = 0
         hold.reset(); versions.reset(); fpsWatch.reset()
         dataPitch = 0; dataBw = false; dataCell = 0.0; dataEdges = DoubleArray(0); lastRows = emptyList()
@@ -536,7 +557,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     private fun tier() = CameraChoice.streamFor(mode, choice.tier)
 
     // the camera runs only while there is something to read
-    private fun wantCamera() = granted() && labState == null && doneFile == null && stopped == null && !batchDone
+    private fun wantCamera() = granted() && labState == null && doneFile == null && stopped == null && !batchDone && !pauseClock.paused
 
     private fun rotation() = preview.display?.rotation ?: Surface.ROTATION_0
 
@@ -744,7 +765,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
             } catch (_: Throwable) {}
         }
         // Done and No space are fixed screens until New transfer (Details keep the numbers they ended with)
-        if (doneFile != null || stopped != null || batchDone) return
+        if (doneFile != null || stopped != null || batchDone || pauseClock.paused) return
         lastRows = detailRows(s)
         screen.setDetails(lastRows)   // kept while Details are off, shown when they are turned on
         if (cameraProblem) return
@@ -820,7 +841,10 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         val name = s.str("filename")
         // live progress: unique blocks received (bytes_done moves only when a whole 16 MB segment verifies)
         val done = maxOf(s.optLong("bytes_done"), s.optLong("received_bytes")); val total = s.optLong("stream_size")
-        val mbit = s.optDouble("mbit_per_s", 0.0)
+        // time and speed leave the pauses out (uptime, like the core's clock, stops while the phone sleeps)
+        val pausedMs = pauseClock.pausedMs(SystemClock.uptimeMillis())
+        val secs = Pause.active(s.optDouble("seconds", 0.0), pausedMs)
+        val mbit = Pause.rate(s.optDouble("mbit_per_s", 0.0), s.optDouble("seconds", 0.0), pausedMs)
         val failure = s.str("last_error").takeIf { failAt > 0 && now - failAt < Guidance.FRESH_MS }
         val readsWell = fresh && s.optLong("codewords") > 0 && s.optLong("codewords_ok") >= s.optLong("codewords") * Guidance.READS_WELL
         val close = tooClose.update(now, afState, focusDiopters, minFocusDiopters, readsWell)
@@ -847,8 +871,8 @@ class MainActivity : AppCompatActivity(), ScreenHost {
         }
         s.str("complete")?.let {
             val out = File(it)
-            if (batch != null && out.isDirectory) enterBatchDone(out, s.optDouble("seconds", 0.0), total, counted = true)
-            else enterDone(out, s.optDouble("seconds", 0.0), total, counted = true, sha = ShaText.valid(s.str("sha256")))
+            if (batch != null && out.isDirectory) enterBatchDone(out, secs, total, counted = true)
+            else enterDone(out, secs, total, counted = true, sha = ShaText.valid(s.str("sha256")))
             return
         }
         s.str("receiver_error")?.let { showReceiverError(it); return }
@@ -1187,7 +1211,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
     // received file of it has no successful save
     private fun updateBack() {
         val kept = if (batchDone) savedOrShared || ledger.allSaved(receivedCount()) else savedOrShared
-        backCallback.isEnabled = backEnabled(pane != Pane.NONE, batchDone, doneFile != null || batchDone, kept, backAsked, saving)
+        backCallback.isEnabled = pauseClock.paused || backEnabled(pane != Pane.NONE, batchDone, doneFile != null || batchDone, kept, backAsked, saving)
     }
 
     private fun askBeforeLeaving() {
@@ -1716,6 +1740,7 @@ class MainActivity : AppCompatActivity(), ScreenHost {
                 "aim_square" -> UiState.Aim(Hints.SQUARE)
                 "locked" -> UiState.Locked(null, Hints.GOOD)
                 "receiving", "problem_fps" -> receiving
+                "paused" -> UiState.Paused(14_900_000, 39_321_600)
                 // a 5 GB file (320 parts) near its end: a four-word code, the longest there is
                 "receiving_words" -> UiState.Receiving("site-backup.tar", 4_960_000_000, 5_368_709_120, 3.48, 940, Hints.GOOD,
                     finishWords = "satin lullaby disco apple", finishParts = "Parts 4, 15") // the parts its window names
