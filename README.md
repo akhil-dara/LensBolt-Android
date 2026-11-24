@@ -3,6 +3,9 @@
 Air-gapped receiver: point the back camera at a LensBolt sender screen; the file lands in `Downloads/LensBolt`,
 SHA-256 verified. No network permission.
 
+Install it from [Google Play](https://play.google.com/store/apps/details?id=com.lensbolt.app), or take the APK from [Releases](https://github.com/akhil-dara/lensbolt-android/releases/latest).
+The two are signed with different keys, so one cannot update the other: uninstall first to switch.
+
 - `native/`: JNI crate over `core/` (`flat::live::LiveReceiver`). Captures are offered once and never block
   the camera: taken only while a decode worker is free, else dropped (the fountain code absorbs it). Decode
   and receiver panics cost one capture, not the session.
